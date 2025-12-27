@@ -9,8 +9,8 @@ const SPEEDY_BASE = "https://api.speedy.bg/v1";
 
 function withAuth(body = {}) {
   return {
-    userName: body.userName || process.env.SPEEDY_USERNAME,
-    password: body.password || process.env.SPEEDY_PASSWORD,
+    userName: body.userName || body?.userName,
+    password: body.password || body?.password,
     language: "BG",
     ...body,
   };
