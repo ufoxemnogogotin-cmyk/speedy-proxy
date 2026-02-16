@@ -127,13 +127,14 @@ async function resolveSiteId({ userName, password, language, cityName, postCode 
   let lastRes = null;
 
   for (const a of attempts) {
-    const payload = {
-      userName,
-      password,
-      language: language || DEFAULT_LANG,
-      name: a.name,
-      postCode: a.postCode,
-    };
+const payload = {
+  userName,
+  password,
+  language: language || DEFAULT_LANG,
+  countryId: 100, // ✅ BG (Speedy)
+  name: a.name,
+  postCode: a.postCode,
+};
 
     const res = await speedyPost("location/site/", payload);
     lastRes = res;
@@ -297,13 +298,15 @@ app.get("/", (req, res) => {
 app.post("/location/site", async (req, res) => {
   try {
     const b = req.body || {};
-    const payload = {
-      userName: safeStr(b.userName || b.username),
-      password: safeStr(b.password),
-      language: safeStr(b.language || DEFAULT_LANG) || DEFAULT_LANG,
-      name: cleanCityName(safeStr(b.name || b.city || "")),
-      postCode: safeStr(b.postCode || b.zip || ""),
-    };
+const payload = {
+  userName: safeStr(b.userName || b.username),
+  password: safeStr(b.password),
+  language: safeStr(b.language || DEFAULT_LANG) || DEFAULT_LANG,
+  countryId: toInt(b.countryId) || 100, // ✅ allow override, default BG
+  name: cleanCityName(safeStr(b.name || b.city || "")),
+  postCode: safeStr(b.postCode || b.zip || ""),
+};
+
     const data = await speedyPost("location/site/", payload);
     res.json(data);
   } catch (e) {
