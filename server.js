@@ -20,21 +20,26 @@ function clone(obj) {
   return obj ? JSON.parse(JSON.stringify(obj)) : obj;
 }
 
+function toIntSafe(v) {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === "number" ? v : Number(String(v).trim());
+  return Number.isFinite(n) ? n : null;
+}
+
 function getDefaultDropoffOfficeId(body) {
   // Priority: explicit in request -> ENV -> fallback
   const fromReq =
     body?.sender?.dropoffOfficeId ??
     body?.dropoffOfficeId ??
     body?.senderOfficeId ??
-    body?.sender_office_id;
+    body?.sender_office_id ??
+    body?.speedy_office_id;
 
-  const parsedReq = Number(fromReq);
-  if (Number.isFinite(parsedReq) && parsedReq > 0 && parsedReq <= 2147483647) {
-    return parsedReq;
-  }
+  const parsedReq = toIntSafe(fromReq);
+  if (parsedReq && parsedReq > 0 && parsedReq <= 2147483647) return parsedReq;
 
-  const env = Number(process.env.SPEEDY_DROPOFF_OFFICE_ID);
-  if (Number.isFinite(env) && env > 0) return env;
+  const env = toIntSafe(process.env.SPEEDY_DROPOFF_OFFICE_ID);
+  if (env && env > 0 && env <= 2147483647) return env;
 
   return 55; // safe fallback (Yambol office in your tests)
 }
@@ -42,110 +47,98 @@ function getDefaultDropoffOfficeId(body) {
 function normalizeShipmentBody(input = {}) {
   const body = clone(input);
 
-  // unwrap shipment if present
+  // unwrap { shipment: {...} } if present
   if (body?.shipment && typeof body.shipment === "object") {
     const { shipment, ...rest } = body;
     return normalizeShipmentBody({ ...rest, ...shipment });
   }
 
-  // Ensure sender object
   body.sender = body.sender || {};
+  body.recipient = body.recipient || {};
+  body.service = body.service || {};
+  body.content = body.content || {};
+  body.payment = body.payment || {};
 
-  // Map "senderObjectId"/"sender_object_id" to sender.clientId if present
+  // ---- sender: map "senderObjectId" (your UI field) -> sender.clientId
   if (!body.sender.clientId) {
     const maybeClientId =
       body.senderObjectId ??
       body.sender_object_id ??
       body.senderClientId ??
-      body.sender_client_id;
+      body.sender_client_id ??
+      body.senderId ??
+      body.sender_id;
 
-    if (maybeClientId) body.sender.clientId = Number(maybeClientId);
+    const cid = toIntSafe(maybeClientId);
+    if (cid) body.sender.clientId = cid;
+  } else {
+    body.sender.clientId = toIntSafe(body.sender.clientId);
   }
 
-  // 🔥 Fix: If dropoffOfficeId is huge (looks like clientId), move it to clientId and set a real office id.
-  const drop = body?.sender?.dropoffOfficeId;
-  if (typeof drop === "number" && drop > 2147483647) {
-    if (!body.sender.clientId) body.sender.clientId = drop;
+  // ---- 🔥 The exact bug: clientId accidentally passed as dropoffOfficeId
+  const drop = body.sender.dropoffOfficeId;
+  const dropN = toIntSafe(drop);
+
+  if (dropN && dropN > 2147483647) {
+    // looks like a clientId, not an officeId
+    if (!body.sender.clientId) body.sender.clientId = dropN;
     body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
-  } else if (typeof drop === "string") {
-    const n = Number(drop);
-    if (Number.isFinite(n) && n > 2147483647) {
-      if (!body.sender.clientId) body.sender.clientId = n;
-      body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
-    }
+  } else if (dropN) {
+    body.sender.dropoffOfficeId = dropN;
   }
 
-  // Ensure we HAVE dropoffOfficeId (MVP office drop-off flow)
+  // ---- Office MVP: ensure dropoffOfficeId exists (so we don't trigger address pickup rules)
   if (!body.sender.dropoffOfficeId) {
     body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
   }
 
-  // ✅ FIX 1: If sender has clientId (contract client), it CANNOT be private person
-  // Speedy rejects privatePerson=true when clientId is present.
-  if (body?.sender?.clientId) {
-    body.sender.privatePerson = false;
-    delete body.sender.private_person;
-  } else if (body?.sender && typeof body.sender.privatePerson === "string") {
-    // normalize string boolean if ever sent
-    body.sender.privatePerson = body.sender.privatePerson.toLowerCase() === "true";
+  // ---- Speedy rule: if sender has clientId/id -> sender.privatePerson MUST NOT be present/true
+  // Also remove sender names when clientId is provided (Speedy gets picky)
+  if (body.sender.clientId) {
+    if ("privatePerson" in body.sender) delete body.sender.privatePerson;
+    if ("clientName" in body.sender) delete body.sender.clientName;
+    if ("name" in body.sender) delete body.sender.name;
+    if ("contactName" in body.sender) delete body.sender.contactName;
   }
 
-  // ✅ FIX 2: Speedy rejects sender when BOTH id and name fields are present.
-  // If we use sender.clientId, we MUST NOT send sender name/contact/phones/etc.
-  if (body?.sender?.clientId) {
-    delete body.sender.clientName;
-    delete body.sender.contactName;
-    delete body.sender.name;
-    delete body.sender.phone1;
-    delete body.sender.phones;
-    delete body.sender.email;
-  }
-
-  // Normalize payer enum
-  if (body?.payment?.courierServicePayer === "CONTRACT_CLIENT") {
+  // ---- Normalize payer enum
+  if (body.payment?.courierServicePayer === "CONTRACT_CLIENT") {
     body.payment.courierServicePayer = "SENDER";
   }
-  const payer = body?.payment?.courierServicePayer;
-  if (typeof payer === "string") {
-    const p = payer.toUpperCase();
-    if (["SENDER", "RECIPIENT", "THIRD_PARTY"].includes(p)) {
-      body.payment.courierServicePayer = p;
-    }
+  if (typeof body.payment?.courierServicePayer === "string") {
+    const p = body.payment.courierServicePayer.toUpperCase();
+    if (["SENDER", "RECIPIENT", "THIRD_PARTY"].includes(p)) body.payment.courierServicePayer = p;
   }
 
-  // Normalize pickupDate casing (Speedy cares)
-  if (body?.service) {
-    if (body.service.pickupDate && !body.service.pickUpDate) {
-      body.service.pickUpDate = body.service.pickupDate;
-      delete body.service.pickupDate;
-    }
+  // ---- Normalize pickupDate casing (Speedy expects pickUpDate)
+  if (body.service.pickupDate && !body.service.pickUpDate) {
+    body.service.pickUpDate = body.service.pickupDate;
+    delete body.service.pickupDate;
   }
 
-  // Content defaults (Speedy required for your contract)
-  body.content = body.content || {};
+  // ---- Content defaults (required in your contract tests)
   if (!body.content.package) body.content.package = "BOX";
 
-  // Recipient normalization
-  if (body?.recipient) {
-    const r = body.recipient;
+  // ---- Recipient normalization
+  // For office deliveries Speedy often hates "contactName" and sometimes "name"
+  if (body.recipient.pickupOfficeId) {
+    if ("contactName" in body.recipient) delete body.recipient.contactName;
+    if ("name" in body.recipient) delete body.recipient.name;
+  }
 
-    // office delivery sometimes rejects contactName/name
-    if (r.pickupOfficeId) {
-      if ("contactName" in r) delete r.contactName;
-      if ("name" in r) delete r.name;
-    }
+  // Ensure recipient.clientName exists
+  if (!body.recipient.clientName) {
+    const fallback =
+      (body.delivery_first_name || body.firstName || "").toString().trim() +
+      " " +
+      (body.delivery_last_name || body.lastName || "").toString().trim();
+    body.recipient.clientName = fallback.trim() || "CLIENT";
+  }
 
-    if (!r.clientName) {
-      const first = body?.delivery_first_name || body?.firstName || "";
-      const last = body?.delivery_last_name || body?.lastName || "";
-      const fallback = `${first} ${last}`.trim();
-      r.clientName = fallback || r.name || "CLIENT";
-    }
-
-    if (!r.phone1 && typeof r.phone === "string") {
-      r.phone1 = { number: r.phone };
-      delete r.phone;
-    }
+  // Normalize recipient phone
+  if (!body.recipient.phone1 && typeof body.recipient.phone === "string") {
+    body.recipient.phone1 = { number: body.recipient.phone };
+    delete body.recipient.phone;
   }
 
   return body;
@@ -154,14 +147,14 @@ function normalizeShipmentBody(input = {}) {
 function normalizePrintBody(input = {}) {
   const body = clone(input);
 
-  // Accept old format: { shipments:[id] } and convert to parcels array
+  // Accept shipments:[id] -> convert to parcels:[{parcel:{id}}]
   if (Array.isArray(body.shipments) && body.shipments.length > 0) {
     const ids = body.shipments.map((x) => String(x));
     delete body.shipments;
     body.parcels = ids.map((id) => ({ parcel: { id } }));
   }
 
-  // Accept { parcelId } or { id } as fallback
+  // If parcelId/id is given
   if (!body.parcels) {
     const maybeId = body.parcelId ?? body.id;
     if (maybeId) body.parcels = [{ parcel: { id: String(maybeId) } }];
@@ -181,10 +174,7 @@ async function speedyPost(path, body) {
 
   const text = await res.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
-
+  try { json = JSON.parse(text); } catch {}
   return { ok: res.ok, status: res.status, json, raw: text };
 }
 
