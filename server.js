@@ -29,12 +29,9 @@ function getDefaultDropoffOfficeId(body) {
     body?.sender_office_id;
 
   const parsedReq = Number(fromReq);
-  if (
-    Number.isFinite(parsedReq) &&
-    parsedReq > 0 &&
-    parsedReq <= 2147483647
-  )
+  if (Number.isFinite(parsedReq) && parsedReq > 0 && parsedReq <= 2147483647) {
     return parsedReq;
+  }
 
   const env = Number(process.env.SPEEDY_DROPOFF_OFFICE_ID);
   if (Number.isFinite(env) && env > 0) return env;
@@ -83,7 +80,17 @@ function normalizeShipmentBody(input = {}) {
     body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
   }
 
-  // ✅ FIX: Speedy rejects sender when BOTH id and name fields are present.
+  // ✅ FIX 1: If sender has clientId (contract client), it CANNOT be private person
+  // Speedy rejects privatePerson=true when clientId is present.
+  if (body?.sender?.clientId) {
+    body.sender.privatePerson = false;
+    delete body.sender.private_person;
+  } else if (body?.sender && typeof body.sender.privatePerson === "string") {
+    // normalize string boolean if ever sent
+    body.sender.privatePerson = body.sender.privatePerson.toLowerCase() === "true";
+  }
+
+  // ✅ FIX 2: Speedy rejects sender when BOTH id and name fields are present.
   // If we use sender.clientId, we MUST NOT send sender name/contact/phones/etc.
   if (body?.sender?.clientId) {
     delete body.sender.clientName;
@@ -161,9 +168,7 @@ function normalizePrintBody(input = {}) {
   }
 
   body.paperSize = body.paperSize || "A6";
-  body.additionalWaybillSenderCopy =
-    body.additionalWaybillSenderCopy || "NONE";
-
+  body.additionalWaybillSenderCopy = body.additionalWaybillSenderCopy || "NONE";
   return body;
 }
 
@@ -191,10 +196,7 @@ async function speedyPostPdf(path, body) {
   });
 
   const ct = res.headers.get("content-type") || "";
-  if (
-    !ct.includes("application/pdf") &&
-    !ct.includes("application/octet-stream")
-  ) {
+  if (!ct.includes("application/pdf") && !ct.includes("application/octet-stream")) {
     const text = await res.text();
     return { ok: false, status: res.status, raw: text, contentType: ct };
   }
@@ -232,8 +234,7 @@ app.post("/location/offices-by-site", async (req, res) => {
 app.post("/shipment", async (req, res) => {
   const body = normalizeShipmentBody(req.body || {});
   const r = await speedyPost("/shipment/", body);
-  if (!r.ok)
-    return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
+  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
   res.json(r.json);
 });
 
