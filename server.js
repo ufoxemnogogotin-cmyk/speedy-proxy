@@ -8,8 +8,6 @@ app.use(express.json({ limit: "10mb" }));
 const SPEEDY_BASE = "https://api.speedy.bg/v1";
 
 function withAuth(body = {}) {
-  // Приемаме creds и от request (както ти е в app settings),
-  // но ако не са пратени — падаме към ENV (ако решиш после да ги местиш).
   return {
     userName: body.userName ?? process.env.SPEEDY_USERNAME,
     password: body.password ?? process.env.SPEEDY_PASSWORD,
@@ -18,18 +16,69 @@ function withAuth(body = {}) {
   };
 }
 
-function normalizeShipmentBody(body = {}) {
-  // 1) courierServicePayer мапване (за да не гърми createShipment)
+// Utility: shallow safe clone
+function clone(obj) {
+  return obj ? JSON.parse(JSON.stringify(obj)) : obj;
+}
+
+function normalizeShipmentBody(input = {}) {
+  // Accept either:
+  // 1) { sender, recipient, service, content, payment, ... }
+  // 2) { shipment: { ... } }
+  // 3) { userName, password, shipment: {...} }  (we keep creds at root)
+  const body = clone(input);
+
+  // unwrap shipment if present
+  if (body?.shipment && typeof body.shipment === "object") {
+    const { shipment, ...rest } = body;
+    return normalizeShipmentBody({ ...rest, ...shipment });
+  }
+
+  // Normalize payer enum
   if (body?.payment?.courierServicePayer === "CONTRACT_CLIENT") {
     body.payment.courierServicePayer = "SENDER";
   }
-
-  // 2) Допускаме и lowercase варианти (ако worker-a е пратил нещо странно)
   const payer = body?.payment?.courierServicePayer;
   if (typeof payer === "string") {
     const p = payer.toUpperCase();
     if (["SENDER", "RECIPIENT", "THIRD_PARTY"].includes(p)) {
       body.payment.courierServicePayer = p;
+    }
+  }
+
+  // Normalize pickupDate casing (Speedy cares)
+  if (body?.service) {
+    if (body.service.pickupDate && !body.service.pickUpDate) {
+      body.service.pickUpDate = body.service.pickupDate;
+      delete body.service.pickupDate;
+    }
+  }
+
+  // Recipient name rules:
+  // Speedy sometimes requires recipient.clientName (id_or_client_name.required)
+  // If "clientName" missing, try to fill it from common fields.
+  if (body?.recipient) {
+    const r = body.recipient;
+
+    // If sending to office, Speedy can complain about contactName in some schemas.
+    // We'll keep it only if explicitly needed; default: remove it for office deliveries.
+    if (r.pickupOfficeId) {
+      if ("contactName" in r) delete r.contactName;
+      if ("name" in r) delete r.name; // not used in their strict schema sometimes
+    }
+
+    // Fill clientName if missing
+    if (!r.clientName) {
+      const first = body?.delivery_first_name || body?.firstName || "";
+      const last = body?.delivery_last_name || body?.lastName || "";
+      const fallback = `${first} ${last}`.trim();
+      r.clientName = fallback || r.name || "CLIENT";
+    }
+
+    // If phone exists as string somewhere, normalize to { phone1: { number } }
+    if (!r.phone1 && typeof r.phone === "string") {
+      r.phone1 = { number: r.phone };
+      delete r.phone;
     }
   }
 
@@ -60,7 +109,6 @@ async function speedyPostPdf(path, body) {
   });
 
   const ct = res.headers.get("content-type") || "";
-  // Speedy понякога връща application/pdf, понякога application/octet-stream за PDF
   if (!ct.includes("application/pdf") && !ct.includes("application/octet-stream")) {
     const text = await res.text();
     return { ok: false, status: res.status, raw: text };
@@ -74,22 +122,23 @@ async function speedyPostPdf(path, body) {
 app.get("/", (_, res) => res.send("OK: speedy-proxy is live ✅"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// (Optional helper) Get Contract Clients (за да намериш правилния sender object/clientId)
+// contract clients helper (sender clientId / objects)
 app.post("/client/contract", async (req, res) => {
   const r = await speedyPost("/client/contract/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
-  return res.status(200).json(r.json);
+  res.json(r.json);
 });
 
-// sites (ако ти трябва)
+// sites
 app.post("/location/site", async (req, res) => {
   const r = await speedyPost("/location/site/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
-// offices (ако ти трябва)
-app.post("/location/office", async (req, res) => {
+// offices by site (helper)
+app.post("/location/offices-by-site", async (req, res) => {
+  // expects { siteId: <number> }
   const r = await speedyPost("/location/office/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
@@ -97,10 +146,9 @@ app.post("/location/office", async (req, res) => {
 
 // create shipment
 app.post("/shipment", async (req, res) => {
-  const body = normalizeShipmentBody({ ...(req.body || {}) });
+  const body = normalizeShipmentBody(req.body || {});
   const r = await speedyPost("/shipment/", body);
 
-  // Връщаме реалния status + payload от Speedy (не 500 на всичко)
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
