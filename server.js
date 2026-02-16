@@ -16,22 +16,68 @@ function withAuth(body = {}) {
   };
 }
 
-// Utility: shallow safe clone
 function clone(obj) {
   return obj ? JSON.parse(JSON.stringify(obj)) : obj;
 }
 
+function getDefaultDropoffOfficeId(body) {
+  // Priority: explicit in request -> ENV -> fallback
+  const fromReq =
+    body?.sender?.dropoffOfficeId ??
+    body?.dropoffOfficeId ??
+    body?.senderOfficeId ??
+    body?.sender_office_id;
+
+  const parsedReq = Number(fromReq);
+  if (Number.isFinite(parsedReq) && parsedReq > 0 && parsedReq <= 2147483647) return parsedReq;
+
+  const env = Number(process.env.SPEEDY_DROPOFF_OFFICE_ID);
+  if (Number.isFinite(env) && env > 0) return env;
+
+  return 55; // safe fallback (Yambol office in your tests)
+}
+
 function normalizeShipmentBody(input = {}) {
-  // Accept either:
-  // 1) { sender, recipient, service, content, payment, ... }
-  // 2) { shipment: { ... } }
-  // 3) { userName, password, shipment: {...} }  (we keep creds at root)
   const body = clone(input);
 
   // unwrap shipment if present
   if (body?.shipment && typeof body.shipment === "object") {
     const { shipment, ...rest } = body;
     return normalizeShipmentBody({ ...rest, ...shipment });
+  }
+
+  // Ensure sender object
+  body.sender = body.sender || {};
+
+  // Map "senderObjectId"/"sender_object_id" to sender.clientId if present
+  if (!body.sender.clientId) {
+    const maybeClientId =
+      body.senderObjectId ??
+      body.sender_object_id ??
+      body.senderClientId ??
+      body.sender_client_id;
+
+    if (maybeClientId) body.sender.clientId = Number(maybeClientId);
+  }
+
+  // 🔥 Fix the exact bug you hit:
+  // If dropoffOfficeId is huge (looks like clientId), move it to clientId and set a real office id.
+  const drop = body?.sender?.dropoffOfficeId;
+  if (typeof drop === "number" && drop > 2147483647) {
+    if (!body.sender.clientId) body.sender.clientId = drop;
+    body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
+  } else if (typeof drop === "string") {
+    const n = Number(drop);
+    if (Number.isFinite(n) && n > 2147483647) {
+      if (!body.sender.clientId) body.sender.clientId = n;
+      body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
+    }
+  }
+
+  // If sender type is office-flow (MVP), ensure we HAVE dropoffOfficeId
+  // (prevents the "expired pickup" for address collection)
+  if (!body.sender.dropoffOfficeId) {
+    body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
   }
 
   // Normalize payer enum
@@ -54,20 +100,20 @@ function normalizeShipmentBody(input = {}) {
     }
   }
 
-  // Recipient name rules:
-  // Speedy sometimes requires recipient.clientName (id_or_client_name.required)
-  // If "clientName" missing, try to fill it from common fields.
+  // Content defaults (Speedy required for your contract)
+  body.content = body.content || {};
+  if (!body.content.package) body.content.package = "BOX";
+
+  // Recipient normalization
   if (body?.recipient) {
     const r = body.recipient;
 
-    // If sending to office, Speedy can complain about contactName in some schemas.
-    // We'll keep it only if explicitly needed; default: remove it for office deliveries.
+    // office delivery sometimes rejects contactName/name
     if (r.pickupOfficeId) {
       if ("contactName" in r) delete r.contactName;
-      if ("name" in r) delete r.name; // not used in their strict schema sometimes
+      if ("name" in r) delete r.name;
     }
 
-    // Fill clientName if missing
     if (!r.clientName) {
       const first = body?.delivery_first_name || body?.firstName || "";
       const last = body?.delivery_last_name || body?.lastName || "";
@@ -75,13 +121,31 @@ function normalizeShipmentBody(input = {}) {
       r.clientName = fallback || r.name || "CLIENT";
     }
 
-    // If phone exists as string somewhere, normalize to { phone1: { number } }
     if (!r.phone1 && typeof r.phone === "string") {
       r.phone1 = { number: r.phone };
       delete r.phone;
     }
   }
 
+  return body;
+}
+
+function normalizePrintBody(input = {}) {
+  const body = clone(input);
+
+  if (Array.isArray(body.shipments) && body.shipments.length > 0) {
+    const ids = body.shipments.map((x) => String(x));
+    delete body.shipments;
+    body.parcels = ids.map((id) => ({ parcel: { id } }));
+  }
+
+  if (!body.parcels) {
+    const maybeId = body.parcelId ?? body.id;
+    if (maybeId) body.parcels = [{ parcel: { id: String(maybeId) } }];
+  }
+
+  body.paperSize = body.paperSize || "A6";
+  body.additionalWaybillSenderCopy = body.additionalWaybillSenderCopy || "NONE";
   return body;
 }
 
@@ -94,10 +158,7 @@ async function speedyPost(path, body) {
 
   const text = await res.text();
   let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
-
+  try { json = JSON.parse(text); } catch {}
   return { ok: res.ok, status: res.status, json, raw: text };
 }
 
@@ -111,52 +172,54 @@ async function speedyPostPdf(path, body) {
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/pdf") && !ct.includes("application/octet-stream")) {
     const text = await res.text();
-    return { ok: false, status: res.status, raw: text };
+    return { ok: false, status: res.status, raw: text, contentType: ct };
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
-  return { ok: true, status: res.status, pdf: buf };
+  return { ok: true, status: res.status, pdf: buf, contentType: ct };
 }
 
 // health
 app.get("/", (_, res) => res.send("OK: speedy-proxy is live ✅"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// contract clients helper (sender clientId / objects)
 app.post("/client/contract", async (req, res) => {
   const r = await speedyPost("/client/contract/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
-// sites
 app.post("/location/site", async (req, res) => {
   const r = await speedyPost("/location/site/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
-// offices by site (helper)
 app.post("/location/offices-by-site", async (req, res) => {
-  // expects { siteId: <number> }
   const r = await speedyPost("/location/office/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
-// create shipment
 app.post("/shipment", async (req, res) => {
   const body = normalizeShipmentBody(req.body || {});
   const r = await speedyPost("/shipment/", body);
-
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
+  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
   res.json(r.json);
 });
 
-// print label (PDF)
 app.post("/print", async (req, res) => {
-  const r = await speedyPostPdf("/print/", req.body);
-  if (!r.ok) return res.status(r.status).send(r.raw);
+  const body = normalizePrintBody(req.body || {});
+  const r = await speedyPostPdf("/print/", body);
+
+  if (!r.ok) {
+    return res.status(r.status).json({
+      error: "Speedy did not return PDF",
+      contentType: r.contentType,
+      raw: r.raw,
+      sentBody: body,
+    });
+  }
 
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", 'inline; filename="speedy-label.pdf"');
