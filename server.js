@@ -29,7 +29,12 @@ function getDefaultDropoffOfficeId(body) {
     body?.sender_office_id;
 
   const parsedReq = Number(fromReq);
-  if (Number.isFinite(parsedReq) && parsedReq > 0 && parsedReq <= 2147483647) return parsedReq;
+  if (
+    Number.isFinite(parsedReq) &&
+    parsedReq > 0 &&
+    parsedReq <= 2147483647
+  )
+    return parsedReq;
 
   const env = Number(process.env.SPEEDY_DROPOFF_OFFICE_ID);
   if (Number.isFinite(env) && env > 0) return env;
@@ -60,8 +65,7 @@ function normalizeShipmentBody(input = {}) {
     if (maybeClientId) body.sender.clientId = Number(maybeClientId);
   }
 
-  // 🔥 Fix the exact bug you hit:
-  // If dropoffOfficeId is huge (looks like clientId), move it to clientId and set a real office id.
+  // 🔥 Fix: If dropoffOfficeId is huge (looks like clientId), move it to clientId and set a real office id.
   const drop = body?.sender?.dropoffOfficeId;
   if (typeof drop === "number" && drop > 2147483647) {
     if (!body.sender.clientId) body.sender.clientId = drop;
@@ -74,10 +78,20 @@ function normalizeShipmentBody(input = {}) {
     }
   }
 
-  // If sender type is office-flow (MVP), ensure we HAVE dropoffOfficeId
-  // (prevents the "expired pickup" for address collection)
+  // Ensure we HAVE dropoffOfficeId (MVP office drop-off flow)
   if (!body.sender.dropoffOfficeId) {
     body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
+  }
+
+  // ✅ FIX: Speedy rejects sender when BOTH id and name fields are present.
+  // If we use sender.clientId, we MUST NOT send sender name/contact/phones/etc.
+  if (body?.sender?.clientId) {
+    delete body.sender.clientName;
+    delete body.sender.contactName;
+    delete body.sender.name;
+    delete body.sender.phone1;
+    delete body.sender.phones;
+    delete body.sender.email;
   }
 
   // Normalize payer enum
@@ -133,19 +147,23 @@ function normalizeShipmentBody(input = {}) {
 function normalizePrintBody(input = {}) {
   const body = clone(input);
 
+  // Accept old format: { shipments:[id] } and convert to parcels array
   if (Array.isArray(body.shipments) && body.shipments.length > 0) {
     const ids = body.shipments.map((x) => String(x));
     delete body.shipments;
     body.parcels = ids.map((id) => ({ parcel: { id } }));
   }
 
+  // Accept { parcelId } or { id } as fallback
   if (!body.parcels) {
     const maybeId = body.parcelId ?? body.id;
     if (maybeId) body.parcels = [{ parcel: { id: String(maybeId) } }];
   }
 
   body.paperSize = body.paperSize || "A6";
-  body.additionalWaybillSenderCopy = body.additionalWaybillSenderCopy || "NONE";
+  body.additionalWaybillSenderCopy =
+    body.additionalWaybillSenderCopy || "NONE";
+
   return body;
 }
 
@@ -158,7 +176,10 @@ async function speedyPost(path, body) {
 
   const text = await res.text();
   let json = null;
-  try { json = JSON.parse(text); } catch {}
+  try {
+    json = JSON.parse(text);
+  } catch {}
+
   return { ok: res.ok, status: res.status, json, raw: text };
 }
 
@@ -170,7 +191,10 @@ async function speedyPostPdf(path, body) {
   });
 
   const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("application/pdf") && !ct.includes("application/octet-stream")) {
+  if (
+    !ct.includes("application/pdf") &&
+    !ct.includes("application/octet-stream")
+  ) {
     const text = await res.text();
     return { ok: false, status: res.status, raw: text, contentType: ct };
   }
@@ -183,31 +207,37 @@ async function speedyPostPdf(path, body) {
 app.get("/", (_, res) => res.send("OK: speedy-proxy is live ✅"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// contract clients
 app.post("/client/contract", async (req, res) => {
   const r = await speedyPost("/client/contract/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
+// sites
 app.post("/location/site", async (req, res) => {
   const r = await speedyPost("/location/site/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
+// offices by site
 app.post("/location/offices-by-site", async (req, res) => {
   const r = await speedyPost("/location/office/", req.body);
   if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
   res.json(r.json);
 });
 
+// create shipment
 app.post("/shipment", async (req, res) => {
   const body = normalizeShipmentBody(req.body || {});
   const r = await speedyPost("/shipment/", body);
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
+  if (!r.ok)
+    return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
   res.json(r.json);
 });
 
+// print label (PDF)
 app.post("/print", async (req, res) => {
   const body = normalizePrintBody(req.body || {});
   const r = await speedyPostPdf("/print/", body);
