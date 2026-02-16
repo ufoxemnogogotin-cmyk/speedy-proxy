@@ -1,251 +1,375 @@
 import express from "express";
 import cors from "cors";
 
+// ---------------- CONFIG ----------------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "2mb" }));
 
+const PORT = process.env.PORT || 3000;
+
+// Speedy upstream
 const SPEEDY_BASE = "https://api.speedy.bg/v1";
 
-function withAuth(body = {}) {
+// If you want to force language BG everywhere
+const DEFAULT_LANG = "BG";
+
+// ---------------- UTILS ----------------
+function stripTrailingSlash(s) {
+  return String(s || "").replace(/\/+$/, "");
+}
+
+function safeStr(x) {
+  return String(x ?? "").trim();
+}
+
+function toInt(x) {
+  const n = Number(String(x ?? "").trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+// "гр. Ямбол" -> "Ямбол"
+function cleanCityName(name) {
+  let s = safeStr(name);
+  s = s.replace(/^гр\.\s*/i, "");
+  s = s.replace(/^град\s+/i, "");
+  return s.trim();
+}
+
+function hasSiteId(obj) {
+  return !!(obj && (obj.siteId || obj.site?.id || obj.id));
+}
+
+// ---------------- SPEEDY CORE CALL ----------------
+async function speedyPost(endpoint, payload) {
+  const url = `${SPEEDY_BASE}/${endpoint.replace(/^\/+/, "")}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const txt = await res.text();
+  let data;
+  try {
+    data = JSON.parse(txt);
+  } catch {
+    data = txt;
+  }
+
+  if (!res.ok) {
+    const errMsg =
+      typeof data === "string"
+        ? data
+        : (data?.error?.message || data?.message || JSON.stringify(data));
+    const e = new Error(`Speedy upstream error (${res.status}): ${errMsg}`);
+    e.status = res.status;
+    e.raw = data;
+    throw e;
+  }
+
+  return data;
+}
+
+// ---------------- SITE RESOLUTION (THE FIX) ----------------
+async function resolveSiteId({ userName, password, language, cityName, postCode }) {
+  const nameRaw = cleanCityName(cityName);
+  const zipRaw = safeStr(postCode);
+
+  // Strategies: try stricter first, then relax
+  const attempts = [];
+
+  // 1) name + postCode
+  if (nameRaw && zipRaw) {
+    attempts.push({ name: nameRaw, postCode: zipRaw });
+  }
+
+  // 2) only name
+  if (nameRaw) {
+    attempts.push({ name: nameRaw, postCode: "" });
+  }
+
+  // 3) only postCode
+  if (zipRaw) {
+    attempts.push({ name: "", postCode: zipRaw });
+  }
+
+  // 4) lowercase/uppercase variants for name (Speedy sometimes matches weird)
+  if (nameRaw) {
+    attempts.push({ name: nameRaw.toUpperCase(), postCode: zipRaw || "" });
+    attempts.push({ name: nameRaw.toLowerCase(), postCode: zipRaw || "" });
+  }
+
+  let lastRes = null;
+
+  for (const a of attempts) {
+    const payload = {
+      userName,
+      password,
+      language: language || DEFAULT_LANG,
+      name: a.name,
+      postCode: a.postCode,
+    };
+
+    const res = await speedyPost("location/site/", payload);
+    lastRes = res;
+
+    const sites = Array.isArray(res) ? res : (res?.sites || res?.result || []);
+    if (Array.isArray(sites) && sites.length) {
+      // Prefer exact postcode match if we have it
+      if (zipRaw) {
+        const exact = sites.find(
+          (s) => safeStr(s?.postCode) === zipRaw || safeStr(s?.postCode)?.startsWith(zipRaw)
+        );
+        if (exact?.id) return { id: exact.id, chosen: exact, tried: payload };
+      }
+
+      // Otherwise take first
+      const first = sites[0];
+      if (first?.id) return { id: first.id, chosen: first, tried: payload };
+    }
+  }
+
+  return { id: 0, chosen: null, tried: attempts, lastRes };
+}
+
+// ---------------- NORMALIZATION ----------------
+// NOTE: This keeps your current behavior but adds door resolution.
+function normalizeShipmentBody(body) {
+  const b = body || {};
+
+  // Worker/client might send either:
+  // { userName, password, language, recipient, service, content, payment, sender }
+  // OR a simplified custom format.
+  const userName = safeStr(b.userName || b.username || b.user || b.UserName);
+  const password = safeStr(b.password || b.pass || b.Password);
+  const language = safeStr(b.language || DEFAULT_LANG) || DEFAULT_LANG;
+
+  // Recipient base
+  const recipient = b.recipient || {};
+  const r = {
+    privatePerson: recipient.privatePerson ?? true,
+    clientName: safeStr(recipient.clientName || b.receiverName || b.recipientName || "—"),
+    phone1: recipient.phone1 || (b.receiverPhone ? { number: safeStr(b.receiverPhone) } : undefined),
+  };
+
+  // OFFICE delivery support
+  const pickupOfficeId =
+    toInt(recipient.pickupOfficeId || b.pickupOfficeId || b.officeId || b.speedyOfficeId || b.receiverOfficeId);
+
+  if (pickupOfficeId) {
+    r.pickupOfficeId = pickupOfficeId;
+  }
+
+  // DOOR delivery support (addressNote + city/zip)
+  const addr = recipient.address || {};
+  const addrNote = safeStr(
+    addr.addressNote || b.address || b.addressNote || b.receiverAddress || ""
+  );
+
+  const cityName = safeStr(b.city || b.receiverCity || addr.city || addr.cityName || "");
+  const postCode = safeStr(b.postCode || b.zip || b.receiverZip || addr.postCode || "");
+
+  if (!pickupOfficeId) {
+    // door
+    r.address = {
+      siteId: addr.siteId ? toInt(addr.siteId) : 0,
+      postCode: postCode || undefined,
+      addressNote: addrNote || undefined,
+    };
+    // stash for resolver (we'll use these later)
+    r.__cityName = cityName;
+    r.__postCode = postCode;
+  }
+
+  // Service / Content / Payment
+  const service = b.service || {
+    serviceId: toInt(b.serviceId) || 505,
+    autoAdjustPickupDate: true,
+  };
+
+  const content = b.content || {
+    parcelsCount: toInt(b.parcelsCount) || 1,
+    contents: safeStr(b.contents || b.contentDescription || "Online order"),
+    package: safeStr(b.package || "BOX"),
+    totalWeight: Number(b.totalWeight || b.weight || 1),
+  };
+
+  const payment = b.payment || {
+    courierServicePayer: safeStr(b.courierServicePayer || "SENDER"),
+  };
+
+  // Sender (optional but useful if you pass it)
+  const sender = b.sender ? { ...b.sender } : undefined;
+
+  // Cleanup internal fields later
   return {
-    userName: body.userName ?? process.env.SPEEDY_USERNAME,
-    password: body.password ?? process.env.SPEEDY_PASSWORD,
-    language: "BG",
-    ...body,
+    userName,
+    password,
+    language,
+    sender,
+    recipient: r,
+    service,
+    content,
+    payment,
+    ref1: safeStr(b.ref1 || b.reference1 || ""),
+    ref2: safeStr(b.ref2 || b.reference2 || ""),
+    consolidationRef: safeStr(b.consolidationRef || ""),
+    // Keep original for debugging
+    __raw: b,
   };
 }
 
-function clone(obj) {
-  return obj ? JSON.parse(JSON.stringify(obj)) : obj;
-}
+async function enrichRecipientSiteIdIfNeeded(normalized) {
+  const r = normalized.recipient;
 
-function toIntSafe(v) {
-  if (v === null || v === undefined) return null;
-  const n = typeof v === "number" ? v : Number(String(v).trim());
-  return Number.isFinite(n) ? n : null;
-}
+  // only for door delivery
+  if (r?.pickupOfficeId) return normalized;
 
-function getDefaultDropoffOfficeId(body) {
-  // Priority: explicit in request -> ENV -> fallback
-  const fromReq =
-    body?.sender?.dropoffOfficeId ??
-    body?.dropoffOfficeId ??
-    body?.senderOfficeId ??
-    body?.sender_office_id ??
-    body?.speedy_office_id;
+  const hasAddress = !!r?.address;
+  if (!hasAddress) return normalized;
 
-  const parsedReq = toIntSafe(fromReq);
-  if (parsedReq && parsedReq > 0 && parsedReq <= 2147483647) return parsedReq;
+  // If already has siteId => ok
+  if (toInt(r.address.siteId) > 0) return normalized;
 
-  const env = toIntSafe(process.env.SPEEDY_DROPOFF_OFFICE_ID);
-  if (env && env > 0 && env <= 2147483647) return env;
+  const cityName = r.__cityName || "";
+  const postCode = r.__postCode || r.address.postCode || "";
 
-  return 55; // safe fallback (Yambol office in your tests)
-}
-
-function normalizeShipmentBody(input = {}) {
-  const body = clone(input);
-
-  // unwrap { shipment: {...} } if present
-  if (body?.shipment && typeof body.shipment === "object") {
-    const { shipment, ...rest } = body;
-    return normalizeShipmentBody({ ...rest, ...shipment });
+  if (!cityName && !postCode) {
+    const e = new Error("Speedy DOOR: missing city/postcode for siteId resolution.");
+    e.details = { cityName, postCode };
+    throw e;
   }
 
-  body.sender = body.sender || {};
-  body.recipient = body.recipient || {};
-  body.service = body.service || {};
-  body.content = body.content || {};
-  body.payment = body.payment || {};
-
-  // ---- sender: map "senderObjectId" (your UI field) -> sender.clientId
-  if (!body.sender.clientId) {
-    const maybeClientId =
-      body.senderObjectId ??
-      body.sender_object_id ??
-      body.senderClientId ??
-      body.sender_client_id ??
-      body.senderId ??
-      body.sender_id;
-
-    const cid = toIntSafe(maybeClientId);
-    if (cid) body.sender.clientId = cid;
-  } else {
-    body.sender.clientId = toIntSafe(body.sender.clientId);
-  }
-
-  // ---- 🔥 The exact bug: clientId accidentally passed as dropoffOfficeId
-  const drop = body.sender.dropoffOfficeId;
-  const dropN = toIntSafe(drop);
-
-  if (dropN && dropN > 2147483647) {
-    // looks like a clientId, not an officeId
-    if (!body.sender.clientId) body.sender.clientId = dropN;
-    body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
-  } else if (dropN) {
-    body.sender.dropoffOfficeId = dropN;
-  }
-
-  // ---- Office MVP: ensure dropoffOfficeId exists (so we don't trigger address pickup rules)
-  if (!body.sender.dropoffOfficeId) {
-    body.sender.dropoffOfficeId = getDefaultDropoffOfficeId(body);
-  }
-
-  // ---- Speedy rule: if sender has clientId/id -> sender.privatePerson MUST NOT be present/true
-  // Also remove sender names when clientId is provided (Speedy gets picky)
-  if (body.sender.clientId) {
-    if ("privatePerson" in body.sender) delete body.sender.privatePerson;
-    if ("clientName" in body.sender) delete body.sender.clientName;
-    if ("name" in body.sender) delete body.sender.name;
-    if ("contactName" in body.sender) delete body.sender.contactName;
-  }
-
-  // ---- Normalize payer enum
-  if (body.payment?.courierServicePayer === "CONTRACT_CLIENT") {
-    body.payment.courierServicePayer = "SENDER";
-  }
-  if (typeof body.payment?.courierServicePayer === "string") {
-    const p = body.payment.courierServicePayer.toUpperCase();
-    if (["SENDER", "RECIPIENT", "THIRD_PARTY"].includes(p)) body.payment.courierServicePayer = p;
-  }
-
-  // ---- Normalize pickupDate casing (Speedy expects pickUpDate)
-  if (body.service.pickupDate && !body.service.pickUpDate) {
-    body.service.pickUpDate = body.service.pickupDate;
-    delete body.service.pickupDate;
-  }
-
-  // ---- Content defaults (required in your contract tests)
-  if (!body.content.package) body.content.package = "BOX";
-
-  // ---- Recipient normalization
-  // For office deliveries Speedy often hates "contactName" and sometimes "name"
-  if (body.recipient.pickupOfficeId) {
-    if ("contactName" in body.recipient) delete body.recipient.contactName;
-    if ("name" in body.recipient) delete body.recipient.name;
-  }
-
-  // Ensure recipient.clientName exists
-  if (!body.recipient.clientName) {
-    const fallback =
-      (body.delivery_first_name || body.firstName || "").toString().trim() +
-      " " +
-      (body.delivery_last_name || body.lastName || "").toString().trim();
-    body.recipient.clientName = fallback.trim() || "CLIENT";
-  }
-
-  // Normalize recipient phone
-  if (!body.recipient.phone1 && typeof body.recipient.phone === "string") {
-    body.recipient.phone1 = { number: body.recipient.phone };
-    delete body.recipient.phone;
-  }
-
-  return body;
-}
-
-function normalizePrintBody(input = {}) {
-  const body = clone(input);
-
-  // Accept shipments:[id] -> convert to parcels:[{parcel:{id}}]
-  if (Array.isArray(body.shipments) && body.shipments.length > 0) {
-    const ids = body.shipments.map((x) => String(x));
-    delete body.shipments;
-    body.parcels = ids.map((id) => ({ parcel: { id } }));
-  }
-
-  // If parcelId/id is given
-  if (!body.parcels) {
-    const maybeId = body.parcelId ?? body.id;
-    if (maybeId) body.parcels = [{ parcel: { id: String(maybeId) } }];
-  }
-
-  body.paperSize = body.paperSize || "A6";
-  body.additionalWaybillSenderCopy = body.additionalWaybillSenderCopy || "NONE";
-  return body;
-}
-
-async function speedyPost(path, body) {
-  const res = await fetch(SPEEDY_BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(withAuth(body)),
+  const resolved = await resolveSiteId({
+    userName: normalized.userName,
+    password: normalized.password,
+    language: normalized.language,
+    cityName,
+    postCode,
   });
 
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  return { ok: res.ok, status: res.status, json, raw: text };
-}
-
-async function speedyPostPdf(path, body) {
-  const res = await fetch(SPEEDY_BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(withAuth(body)),
-  });
-
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("application/pdf") && !ct.includes("application/octet-stream")) {
-    const text = await res.text();
-    return { ok: false, status: res.status, raw: text, contentType: ct };
+  if (!resolved.id) {
+    const e = new Error(
+      `Speedy DOOR: cannot resolve siteId for city="${cityName}" zip="${postCode}".`
+    );
+    e.details = { cityName, postCode, resolved };
+    throw e;
   }
 
-  const buf = Buffer.from(await res.arrayBuffer());
-  return { ok: true, status: res.status, pdf: buf, contentType: ct };
+  r.address.siteId = resolved.id;
+
+  // remove internal
+  delete r.__cityName;
+  delete r.__postCode;
+
+  normalized.__siteResolution = resolved;
+  return normalized;
 }
 
-// health
-app.get("/", (_, res) => res.send("OK: speedy-proxy is live ✅"));
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-// contract clients
-app.post("/client/contract", async (req, res) => {
-  const r = await speedyPost("/client/contract/", req.body);
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
-  res.json(r.json);
+// ---------------- ROUTES ----------------
+app.get("/", (req, res) => {
+  res.type("text").send("OK LIVE ✅ speedy-proxy");
 });
 
-// sites
+// passthrough site lookup (optional direct use)
 app.post("/location/site", async (req, res) => {
-  const r = await speedyPost("/location/site/", req.body);
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
-  res.json(r.json);
-});
-
-// offices by site
-app.post("/location/offices-by-site", async (req, res) => {
-  const r = await speedyPost("/location/office/", req.body);
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw });
-  res.json(r.json);
-});
-
-// create shipment
-app.post("/shipment", async (req, res) => {
-  const body = normalizeShipmentBody(req.body || {});
-  const r = await speedyPost("/shipment/", body);
-  if (!r.ok) return res.status(r.status).json(r.json ?? { error: r.raw, sentBody: body });
-  res.json(r.json);
-});
-
-// print label (PDF)
-app.post("/print", async (req, res) => {
-  const body = normalizePrintBody(req.body || {});
-  const r = await speedyPostPdf("/print/", body);
-
-  if (!r.ok) {
-    return res.status(r.status).json({
-      error: "Speedy did not return PDF",
-      contentType: r.contentType,
-      raw: r.raw,
-      sentBody: body,
+  try {
+    const b = req.body || {};
+    const payload = {
+      userName: safeStr(b.userName || b.username),
+      password: safeStr(b.password),
+      language: safeStr(b.language || DEFAULT_LANG) || DEFAULT_LANG,
+      name: safeStr(b.name || b.city || ""),
+      postCode: safeStr(b.postCode || b.zip || ""),
+    };
+    const data = await speedyPost("location/site/", payload);
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message || String(e),
+      details: e.raw || e.details || null,
     });
   }
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", 'inline; filename="speedy-label.pdf"');
-  res.send(r.pdf);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Speedy proxy running on", PORT));
+// MAIN: create shipment
+app.post("/shipment", async (req, res) => {
+  try {
+    let normalized = normalizeShipmentBody(req.body);
+
+    if (!normalized.userName || !normalized.password) {
+      return res.status(400).json({ error: "Missing userName/password" });
+    }
+
+    // Enrich door shipments with siteId
+    normalized = await enrichRecipientSiteIdIfNeeded(normalized);
+
+    // Build upstream payload (remove internal debug)
+    const upstream = { ...normalized };
+    delete upstream.__raw;
+
+    // Send to Speedy
+    const data = await speedyPost("shipment/", upstream);
+
+    res.json({
+      ok: true,
+      data,
+      debug: {
+        siteResolution: normalized.__siteResolution || null,
+      },
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      ok: false,
+      error: e.message || String(e),
+      details: e.raw || e.details || null,
+    });
+  }
+});
+
+// Print PDF
+app.post("/print", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const userName = safeStr(b.userName || b.username);
+    const password = safeStr(b.password);
+    const parcelId = safeStr(b.parcelId || b.id || "");
+
+    if (!userName || !password || !parcelId) {
+      return res.status(400).send("Missing userName/password/parcelId");
+    }
+
+    const payload = {
+      userName,
+      password,
+      paperSize: safeStr(b.paperSize || "A4"),
+      parcels: [{ parcel: { id: parcelId } }],
+    };
+
+    const url = `${SPEEDY_BASE}/print/`;
+    const upstreamRes = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!upstreamRes.ok) {
+      const t = await upstreamRes.text();
+      return res.status(upstreamRes.status).send(t);
+    }
+
+    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    res.setHeader("content-type", "application/pdf");
+    res.setHeader("cache-control", "no-store");
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// ---------------- START ----------------
+app.listen(PORT, () => {
+  console.log(`speedy-proxy listening on :${PORT}`);
+});
