@@ -257,7 +257,7 @@ function normalizeShipmentBody(body) {
   const content = b.content || {
     parcelsCount: toInt(b.parcelsCount) || 1,
     contents: safeStr(b.contents || b.contentDescription || "Online order"),
-    package: safeStr(b.package || "BOX"),
+    package: safeStr(b.package || "ПЛИК"),
     totalWeight: Number(b.totalWeight || b.weight || 1),
   };
 
