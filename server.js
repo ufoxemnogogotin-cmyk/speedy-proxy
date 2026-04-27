@@ -14,6 +14,9 @@ const SPEEDY_BASE = "https://api.speedy.bg/v1";
 // Force language BG by default
 const DEFAULT_LANG = "BG";
 
+// Над тази сума доставката е за сметка на подателя
+const DEFAULT_FREE_OVER_EUR = Number(process.env.SPEEDY_FREE_OVER_EUR || 0);
+
 // ---------------- UTILS ----------------
 function stripTrailingSlash(s) {
   return String(s || "").replace(/\/+$/, "");
@@ -26,6 +29,40 @@ function safeStr(x) {
 function toInt(x) {
   const n = Number(String(x ?? "").trim());
   return Number.isFinite(n) ? n : 0;
+}
+
+function toMoney(x) {
+  const n = Number(String(x ?? "").replace(",", ".").trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+function pickOrderTotal(b, service) {
+  return toMoney(
+    b.orderTotal ??
+    b.totalAmount ??
+    b.total ??
+    b.codAmount ??
+    service?.additionalServices?.cod?.amount ??
+    0
+  );
+}
+
+function applyFreeShippingPayerRule({ body, service, payment }) {
+  const freeOver = toMoney(body.freeShippingOverEur ?? body.freeOverEur ?? DEFAULT_FREE_OVER_EUR);
+  const orderTotal = pickOrderTotal(body, service);
+
+  const isFreeShipping = freeOver > 0 && orderTotal >= freeOver;
+
+  // под 100 EUR -> получател
+  // над/равно 100 EUR -> подател
+  payment.courierServicePayer = isFreeShipping ? "SENDER" : "RECIPIENT";
+
+  return {
+    freeOver,
+    orderTotal,
+    isFreeShipping,
+    courierServicePayer: payment.courierServicePayer,
+  };
 }
 
 // "гр. Ямбол" -> "Ямбол"
@@ -224,10 +261,17 @@ function normalizeShipmentBody(body) {
     totalWeight: Number(b.totalWeight || b.weight || 1),
   };
 
-  const payment = b.payment || {};
-  payment.courierServicePayer = normalizeCourierServicePayer(
-    payment.courierServicePayer || b.courierServicePayer || "SENDER"
-  );
+const payment = b.payment ? { ...b.payment } : {};
+
+payment.courierServicePayer = normalizeCourierServicePayer(
+  payment.courierServicePayer || b.courierServicePayer || "RECIPIENT"
+);
+
+const paymentDebug = applyFreeShippingPayerRule({
+  body: b,
+  service,
+  payment,
+});
 
   const sender = b.sender ? { ...b.sender } : undefined;
 
@@ -244,6 +288,7 @@ function normalizeShipmentBody(body) {
     ref2: safeStr(b.ref2 || b.reference2 || ""),
     consolidationRef: safeStr(b.consolidationRef || ""),
     __raw: b,
+    __paymentDebug: paymentDebug,
   };
 }
 
@@ -331,20 +376,22 @@ app.post("/shipment", async (req, res) => {
     normalized = await enrichRecipientSiteIdIfNeeded(normalized);
 
     // upstream payload (strip internal)
-    const upstream = { ...normalized };
-    delete upstream.__raw;
-    delete upstream.__siteResolution;
+const upstream = { ...normalized };
+delete upstream.__raw;
+delete upstream.__siteResolution;
+delete upstream.__paymentDebug;
 
     // send to Speedy
     const data = await speedyPost("shipment/", upstream);
 
-    res.json({
-      ok: true,
-      data,
-      debug: {
-        siteResolution: normalized.__siteResolution || null,
-      },
-    });
+res.json({
+  ok: true,
+  data,
+  debug: {
+    siteResolution: normalized.__siteResolution || null,
+    payment: normalized.__paymentDebug || null,
+  },
+});
   } catch (e) {
     res.status(e.status || 500).json({
       ok: false,
