@@ -106,6 +106,70 @@ function normalizeCourierServicePayer(x) {
   return "SENDER";
 }
 
+function isPaidOnline(body) {
+  const b = body || {};
+
+  const financialStatus = safeStr(
+    b.financialStatus ||
+      b.paymentStatus ||
+      b.shopifyFinancialStatus ||
+      b.financial_status ||
+      b.order?.financial_status ||
+      b.order?.financialStatus ||
+      ""
+  ).toLowerCase();
+
+  const paymentMethod = safeStr(
+    b.paymentMethod ||
+      b.gateway ||
+      b.paymentGateway ||
+      b.payment_gateway ||
+      b.order?.gateway ||
+      b.order?.payment_gateway_names?.join(" ") ||
+      ""
+  ).toLowerCase();
+
+  return (
+    financialStatus === "paid" ||
+    financialStatus === "partially_paid" ||
+    paymentMethod.includes("card") ||
+    paymentMethod.includes("stripe") ||
+    paymentMethod.includes("shopify payments") ||
+    paymentMethod.includes("paypal")
+  );
+}
+
+function cleanupSpeedyPaidOnlineService(service) {
+  if (!service?.additionalServices) return service;
+
+  // Платено онлайн = НЕ пращаме наложен платеж и НЕ пращаме опции преди плащане
+  delete service.additionalServices.cod;
+  delete service.additionalServices.obpd;
+
+  if (Object.keys(service.additionalServices).length === 0) {
+    delete service.additionalServices;
+  }
+
+  return service;
+}
+
+function cleanupObpdForPickupOffice(service, recipient) {
+  if (!service?.additionalServices) return service;
+
+  // Speedy не позволява obpd при АПС/автомат.
+  // Понеже при pickupOfficeId не винаги знаем дали е офис или автомат,
+  // махаме obpd като safety net, за да не гърми товарителницата.
+  if (recipient?.pickupOfficeId && service.additionalServices.obpd) {
+    delete service.additionalServices.obpd;
+  }
+
+  if (Object.keys(service.additionalServices).length === 0) {
+    delete service.additionalServices;
+  }
+
+  return service;
+}
+
 // ---------------- SPEEDY CORE CALL ----------------
 async function speedyPost(endpoint, payload) {
   const url = `${SPEEDY_BASE}/${endpoint.replace(/^\/+/, "")}`;
@@ -117,6 +181,7 @@ async function speedyPost(endpoint, payload) {
   });
 
   const txt = await res.text();
+
   let data;
   try {
     data = JSON.parse(txt);
@@ -133,6 +198,17 @@ async function speedyPost(endpoint, payload) {
     const e = new Error(`Speedy upstream error (${res.status}): ${errMsg}`);
     e.status = res.status;
     e.raw = data;
+    throw e;
+  }
+
+  // ВАЖНО:
+  // Speedy понякога връща HTTP 200, но вътре има error.
+  // Това НЕ трябва да минава като успешна заявка.
+  if (data && typeof data === "object" && data.error) {
+    const e = new Error(data.error.message || JSON.stringify(data.error));
+    e.status = 422;
+    e.raw = data;
+    e.speedyError = data.error;
     throw e;
   }
 
@@ -267,11 +343,30 @@ payment.courierServicePayer = normalizeCourierServicePayer(
   payment.courierServicePayer || b.courierServicePayer || "RECIPIENT"
 );
 
-const paymentDebug = applyFreeShippingPayerRule({
-  body: b,
-  service,
-  payment,
-});
+const paidOnline = isPaidOnline(b);
+
+let paymentDebug;
+
+if (paidOnline) {
+  // Платена с карта/онлайн поръчка:
+  // - махаме COD
+  // - махаме OBPD
+  // - доставката е за подателя, защото клиентът вече е платил онлайн
+  cleanupSpeedyPaidOnlineService(service);
+  payment.courierServicePayer = "SENDER";
+
+  paymentDebug = {
+    paidOnline: true,
+    rule: "paid_online_removes_cod_obpd_and_sets_sender_payer",
+    courierServicePayer: payment.courierServicePayer,
+  };
+} else {
+  paymentDebug = applyFreeShippingPayerRule({
+    body: b,
+    service,
+    payment,
+  });
+}
 
   const sender = b.sender ? { ...b.sender } : undefined;
 
@@ -375,23 +470,43 @@ app.post("/shipment", async (req, res) => {
     // enrich door shipments with siteId
     normalized = await enrichRecipientSiteIdIfNeeded(normalized);
 
+    // SAFETY FIX:
+    // Ако е до pickupOfficeId и някъде по веригата е добавено obpd,
+    // го махаме преди Speedy, защото АПС/автомат + obpd гърми.
+    cleanupObpdForPickupOffice(normalized.service, normalized.recipient);
+
     // upstream payload (strip internal)
-const upstream = { ...normalized };
-delete upstream.__raw;
-delete upstream.__siteResolution;
-delete upstream.__paymentDebug;
+    const upstream = { ...normalized };
+    delete upstream.__raw;
+    delete upstream.__siteResolution;
+    delete upstream.__paymentDebug;
+
+    // TEMP DEBUG:
+    // Остави това временно, за да видиш реалния payload към Speedy.
+    // После може да го махнеш.
+    console.log(
+      "SPEEDY UPSTREAM PAYLOAD",
+      JSON.stringify(
+        {
+          ...upstream,
+          password: "***",
+        },
+        null,
+        2
+      )
+    );
 
     // send to Speedy
     const data = await speedyPost("shipment/", upstream);
 
-res.json({
-  ok: true,
-  data,
-  debug: {
-    siteResolution: normalized.__siteResolution || null,
-    payment: normalized.__paymentDebug || null,
-  },
-});
+    res.json({
+      ok: true,
+      data,
+      debug: {
+        siteResolution: normalized.__siteResolution || null,
+        payment: normalized.__paymentDebug || null,
+      },
+    });
   } catch (e) {
     res.status(e.status || 500).json({
       ok: false,
