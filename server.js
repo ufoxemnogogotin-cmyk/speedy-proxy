@@ -528,12 +528,20 @@ app.post("/print", async (req, res) => {
       return res.status(400).send("Missing userName/password/parcelId");
     }
 
-    const payload = {
-      userName,
-      password,
-      paperSize: safeStr(b.paperSize || "A4"),
-      parcels: [{ parcel: { id: parcelId } }],
-    };
+const requestedPaperSize = safeStr(b.paperSize || "A6");
+
+const paperSize = ["A4", "A6", "A4_4xA6"].includes(requestedPaperSize)
+  ? requestedPaperSize
+  : "A6";
+
+const payload = {
+  userName,
+  password,
+  language: safeStr(b.language || DEFAULT_LANG) || DEFAULT_LANG,
+  format: "pdf",
+  paperSize,
+  parcels: [{ parcel: { id: parcelId } }],
+};
 
     const upstreamRes = await fetch(`${SPEEDY_BASE}/print/`, {
       method: "POST",
